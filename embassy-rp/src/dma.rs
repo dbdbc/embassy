@@ -213,7 +213,7 @@ impl<'a, W: Word> Read<'a, W> {
         }
     }
 
-    fn forward(&mut self, n: usize) -> () {
+    fn forward(&mut self, n: usize) {
         if let Self::Increase(w) = *self {
             *self = Self::Increase(&w[n..]);
         }
@@ -228,6 +228,7 @@ struct InnerContinuous<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> {
     read: Read<'r, W>,
 }
 
+// TODO allow support for continuous read and write
 impl<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> InnerContinuous<'a, 'c, 'r, W, C1, C2> {
     // SAFETY: the compiler does not know buffer is still modified after the function returns
     unsafe fn start(&mut self, buffer: &mut [W]) {
@@ -372,6 +373,7 @@ impl<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> Drop for InnerContinuous<'a,
     }
 }
 
+// TODO rename to ContinuousRead
 // contract: if the user has a ContinuousTransfer, it is always running
 // Using InnerContinuous is unsafe, because the rust compiler has no knowledge of the dma
 // channels modifying the buffer. This is why we keep a &mut to the buffer here
@@ -381,6 +383,7 @@ pub struct ContinuousTransfer<'a, 'b, 'c, 'r, W: Word, C1: Channel, C2: Channel>
     buffer: &'b mut [W],
 }
 
+// it is possible to wrap all generics but W, 'b into a Context trait, reducing generics count to 3 TODO
 impl<'a, 'b, 'c, 'r, W: Word, C1: Channel, C2: Channel> ContinuousTransfer<'a, 'b, 'c, 'r, W, C1, C2> {
     pub fn start_new(
         ch1: PeripheralRef<'a, C1>,
