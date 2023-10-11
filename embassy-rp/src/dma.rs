@@ -1,5 +1,7 @@
 //! Direct Memory Access (DMA)
 use core::future::{poll_fn, Future};
+use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Context, Poll};
@@ -192,44 +194,88 @@ impl<'a, C: Channel> Future for Transfer<'a, C> {
     }
 }
 
-pub enum Read<'a, W: Word> {
-    Constant(&'a W),
-    Increase(&'a [W]),
-    // ring also possible, but more complicated due to generic size and alignment requirements
+// dma sources, no ring support so far
+pub trait WriteSource<W: Word> {
+    fn is_increase(&self) -> bool;
+    fn address(&mut self) -> *mut W;
+    fn forward(&mut self, n: usize);
+}
+pub trait ReadSource<W: Word> {
+    fn is_increase(&self) -> bool;
+    fn address(&self) -> *const W;
+    fn forward(&mut self, n: usize);
 }
 
-impl<'a, W: Word> Read<'a, W> {
+struct Constant<W: Word, T: Deref<Target = W>>(T);
+
+impl<W: Word, T: DerefMut<Target = W>> WriteSource<W> for Constant<W, T> {
     fn is_increase(&self) -> bool {
-        match *self {
-            Self::Constant(_) => false,
-            Self::Increase(_) => true,
-        }
+        false
     }
 
-    fn address(&self) -> u32 {
-        match *self {
-            Self::Constant(w) => (w as *const W) as u32,
-            Self::Increase(w) => w.as_ptr() as u32,
-        }
+    fn address(&mut self) -> *mut W {
+        self.0.deref_mut() as *mut W
+    }
+
+    fn forward(&mut self, _n: usize) {}
+}
+
+impl<W: Word, T: Deref<Target = W>> ReadSource<W> for Constant<W, T> {
+    fn is_increase(&self) -> bool {
+        false
+    }
+
+    fn address(&self) -> *const W {
+        self.0.deref() as *const W
+    }
+
+    fn forward(&mut self, _n: usize) {}
+}
+
+struct Increase<W: Word, T: Deref<Target = [W]>> {
+    buf: T,
+    start: usize,
+}
+
+impl<W: Word, T: DerefMut<Target = [W]>> WriteSource<W> for Increase<W, T> {
+    fn is_increase(&self) -> bool {
+        true
+    }
+
+    fn address(&mut self) -> *mut W {
+        self.buf.deref_mut()[self.start..].as_mut_ptr()
     }
 
     fn forward(&mut self, n: usize) {
-        if let Self::Increase(w) = *self {
-            *self = Self::Increase(&w[n..]);
-        }
+        self.start += n;
     }
 }
 
-struct InnerContinuous<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> {
-    data: PeripheralRef<'a, C1>,
-    control: PeripheralRef<'a, C2>,
-    control_input: &'c mut [u32; 4],
-    dreq: TreqSel,
-    read: Read<'r, W>,
+impl<W: Word, T: Deref<Target = [W]>> ReadSource<W> for Increase<W, T> {
+    fn is_increase(&self) -> bool {
+        true
+    }
+
+    fn address(&self) -> *const W {
+        self.buf.deref()[self.start..].as_ptr()
+    }
+
+    fn forward(&mut self, n: usize) {
+        self.start += n;
+    }
 }
 
-// TODO allow support for continuous read and write
-impl<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> InnerContinuous<'a, 'c, 'r, W, C1, C2> {
+struct InnerContinuous<'a, 'b, W: Word, Rs: ReadSource<W>, C1: Channel, C2: Channel> {
+    data: PeripheralRef<'a, C1>,
+    control: PeripheralRef<'a, C2>,
+    control_input: &'b mut [u32; 4],
+    dreq: TreqSel,
+    read: Rs,
+    phantom: PhantomData<W>,
+}
+
+// TODO allow support for continuous write
+impl<'a, 'b, W: Word, Rs: ReadSource<W>, C1: Channel, C2: Channel> InnerContinuous<'a, 'b, W, Rs, C1, C2> {
     // SAFETY: the compiler does not know buffer is still modified after the function returns
     unsafe fn start(&mut self, buffer: &mut [W]) {
         let pc = self.control.regs();
@@ -246,7 +292,12 @@ impl<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> InnerContinuous<'a, 'c, 'r, 
         w.set_en(true);
         w.set_irq_quiet(false);
         // writing to registers: READ_ADDR, WRITE_ADDR, TRANS_COUNT, CTRL_TRIG
-        *self.control_input = [self.read.address(), buffer.as_ptr() as u32, buffer.len() as u32, w.0];
+        *self.control_input = [
+            self.read.address() as u32,
+            buffer.as_ptr() as u32,
+            buffer.len() as u32,
+            w.0,
+        ];
 
         // configure data channel to some values, correct ones will be set by control channel
         pd.read_addr().write_value(0);
@@ -292,7 +343,12 @@ impl<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> InnerContinuous<'a, 'c, 'r, 
         w.set_chain_to(self.data.number()); // chain disabled by default
         w.set_en(true);
         w.set_irq_quiet(false);
-        *self.control_input = [self.read.address(), buffer.as_ptr() as u32, buffer.len() as u32, w.0];
+        *self.control_input = [
+            self.read.address() as u32,
+            buffer.as_ptr() as u32,
+            buffer.len() as u32,
+            w.0,
+        ];
 
         // enable chain of running data channel, now we can't change control safely anymore
         // using al1_ctrl to not trigger the channel in case it stopped
@@ -362,7 +418,7 @@ impl<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> InnerContinuous<'a, 'c, 'r, 
     }
 }
 
-impl<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> Drop for InnerContinuous<'a, 'c, 'r, W, C1, C2> {
+impl<'a, 'b, W: Word, Rs: ReadSource<W>, C1: Channel, C2: Channel> Drop for InnerContinuous<'a, 'b, W, Rs, C1, C2> {
     fn drop(&mut self) {
         pac::DMA
             .chan_abort()
@@ -373,65 +429,60 @@ impl<'a, 'c, 'r, W: Word, C1: Channel, C2: Channel> Drop for InnerContinuous<'a,
     }
 }
 
-// TODO rename to ContinuousRead
-// contract: if the user has a ContinuousTransfer, it is always running
+// contract: if the user has a ContinuousRead, it does not have to be running
+// TODO: test if a stopped ContinuousRead leads to problems when restarting, stopping or aborting
 // Using InnerContinuous is unsafe, because the rust compiler has no knowledge of the dma
-// channels modifying the buffer. This is why we keep a &mut to the buffer here
-pub struct ContinuousTransfer<'a, 'b, 'c, 'r, W: Word, C1: Channel, C2: Channel> {
-    inner: InnerContinuous<'a, 'c, 'r, W, C1, C2>,
-    #[allow(dead_code)]
-    buffer: &'b mut [W],
+// channels modifying the buffer. This is why we keep the buffer here
+pub struct ContinuousRead<'a, 'b, W: Word, Rs: ReadSource<W>, C1: Channel, C2: Channel, T: DerefMut<Target = [W]>> {
+    inner: InnerContinuous<'a, 'b, W, Rs, C1, C2>,
+    _buffer: T,
 }
 
-// it is possible to wrap all generics but W, 'b into a Context trait, reducing generics count to 3 TODO
-impl<'a, 'b, 'c, 'r, W: Word, C1: Channel, C2: Channel> ContinuousTransfer<'a, 'b, 'c, 'r, W, C1, C2> {
+// TODO it is possible to wrap most generics into a Context trait
+impl<'a, 'b, W: Word, Rs: ReadSource<W>, C1: Channel, C2: Channel, T: DerefMut<Target = [W]>>
+    ContinuousRead<'a, 'b, W, Rs, C1, C2, T>
+{
     pub fn start_new(
         ch1: PeripheralRef<'a, C1>,
         ch2: PeripheralRef<'a, C2>,
-        control_input: &'c mut [u32; 4],
-        buffer: &'b mut [W],
+        control_input: &'b mut [u32; 4],
+        mut buffer: T,
         dreq: TreqSel,
-        read: Read<'r, W>,
-    ) -> ContinuousTransfer<'a, 'b, 'c, 'r, W, C1, C2> {
+        read: Rs,
+    ) -> ContinuousRead<'a, 'b, W, Rs, C1, C2, T> {
         let mut inner = InnerContinuous {
             data: ch1,
             control: ch2,
             control_input,
             dreq,
             read,
+            phantom: PhantomData,
         };
-        // SAFETY: we keep a &mut to buffer around to signal it is being written to
-        unsafe { inner.start(buffer) };
-        ContinuousTransfer { inner, buffer }
+        // SAFETY: we keep buffer around to signal it is being written to
+        unsafe { inner.start(buffer.deref_mut()) };
+        ContinuousRead { inner, _buffer: buffer }
     }
 
-    pub async fn next_or_stop<'new_buf>(
+    // to allow switching type/lifetime of _buffer
+    pub async fn next_new<T_: DerefMut<Target = [W]>>(
         self,
-        buffer: &'new_buf mut [W],
-    ) -> Option<ContinuousTransfer<'a, 'new_buf, 'c, 'r, W, C1, C2>> {
-        let ContinuousTransfer {
+        mut buffer: T_,
+        auto_restart: bool,
+    ) -> (ContinuousRead<'a, 'b, W, Rs, C1, C2, T_>, bool) {
+        let ContinuousRead {
             mut inner,
-            buffer: _old,
+            _buffer: _old,
         } = self;
-        // SAFETY: we keep a &mut to buffer around to signal it is being written to
-        let in_time = unsafe { inner.next(buffer, false).await };
-        match in_time {
-            true => Some(ContinuousTransfer { inner, buffer }),
-            false => None,
-        }
+        // SAFETY: we keep buffer around to signal it is being written to
+        let in_time = unsafe { inner.next(buffer.deref_mut(), auto_restart).await };
+        (ContinuousRead { inner, _buffer: buffer }, in_time)
     }
 
-    pub async fn next<'new_buf>(
-        self,
-        buffer: &'new_buf mut [W],
-    ) -> (ContinuousTransfer<'a, 'new_buf, 'c, 'r, W, C1, C2>, bool) {
-        let ContinuousTransfer {
-            mut inner,
-            buffer: _old,
-        } = self;
-        // SAFETY: we keep a &mut to buffer around to signal it is being written to
-        let in_time = unsafe { inner.next(buffer, true).await };
-        (ContinuousTransfer { inner, buffer }, in_time)
+    pub async fn next(&mut self, mut buffer: T, auto_restart: bool) -> bool {
+        // SAFETY: buffer is stored in self to signal it is being written to
+        let in_time = unsafe { self.inner.next(buffer.deref_mut(), auto_restart).await };
+        self._buffer = buffer;
+        in_time
     }
 
     pub async fn stop(mut self) {
